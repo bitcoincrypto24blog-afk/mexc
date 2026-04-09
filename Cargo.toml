@@ -1,0 +1,31 @@
+[package]
+name = "mexc-sniper"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mexc-sniper"
+path = "src/main.rs"
+
+[dependencies]
+tokio              = { version = "1",    features = ["full"] }
+tokio-tungstenite  = { version = "0.21", features = ["native-tls"] }
+futures-util       = "0.3"
+reqwest            = { version = "0.12", features = ["json"] }
+serde              = { version = "1",    features = ["derive"] }
+serde_json         = "1"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+chrono             = { version = "0.4",  features = ["serde"] }
+dotenvy            = "0.15"
+hmac               = "0.12"
+sha2               = "0.10"
+hex                = "0.4"
+anyhow             = "1"
+dashmap            = "5"
+url                = "2"
+
+[profile.release]
+opt-level = 3
+lto       = true
+codegen-units = 1

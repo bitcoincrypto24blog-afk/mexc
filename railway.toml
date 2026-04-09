@@ -1,0 +1,11 @@
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+restartPolicyType = "always"
+restartPolicyMaxRetries = 10
+numReplicas = 1
+
+# Railway will pass these as env vars from the dashboard
+# No ports needed — this is a pure background worker
