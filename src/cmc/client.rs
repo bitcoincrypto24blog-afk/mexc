@@ -28,14 +28,14 @@ struct CmcStatus {
     error_message: Option<String>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 struct CmcCoin {
     slug: String,
     total_supply: Option<f64>,
     quote: Option<std::collections::HashMap<String, CmcQuote>>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 struct CmcQuote {
     price: Option<f64>,
 }
