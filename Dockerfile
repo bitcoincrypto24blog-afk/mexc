@@ -1,5 +1,5 @@
 # ── Stage 1: Builder ──────────────────────────────────────────────────────────
-FROM rust:1.85-slim-bookworm AS builder
+FROM rust:1.86-slim-bookworm AS builder
 
 # Install system deps for native-tls / openssl
 RUN apt-get update && apt-get install -y \
