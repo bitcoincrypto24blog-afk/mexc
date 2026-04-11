@@ -185,26 +185,31 @@ pub async fn run(
 /// Falls back to the Spot-filtered page and the support portal.
 async fn fetch_announcements(client: &reqwest::Client) -> Result<Vec<ScrapedItem>> {
     let pages = [
+        "https://www.mexc.com/newlisting",
         "https://www.mexc.com/announcements/new-listings",
-        "https://www.mexc.com/announcements/new-listings/spot-18",
-        "https://www.mexc.com/announcements/all",
     ];
+
+    let mut all_items: Vec<ScrapedItem> = Vec::new();
+    let mut seen_urls: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for url in &pages {
         match client.get(*url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 let html = resp.text().await.unwrap_or_default();
                 let items = parse_html_announcements(&html);
-                if !items.is_empty() {
-                    info!("📡 Scraped {} announcements from {}", items.len(), url);
-                    return Ok(items);
+                info!("📡 Scraped {} announcements from {}", items.len(), url);
+                for item in items {
+                    if seen_urls.insert(item.article_url.clone()) {
+                        all_items.push(item);
+                    }
                 }
             }
-            _ => {}
+            Err(e) => warn!("Failed to fetch {}: {e}", url),
+            _ => warn!("Non-success response from {}", url),
         }
     }
 
-    Ok(vec![])
+    Ok(all_items)
 }
 
 /// Parse article links, titles and age from raw HTML.
