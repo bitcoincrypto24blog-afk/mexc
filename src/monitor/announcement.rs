@@ -14,27 +14,6 @@ use crate::monitor::{now_ms, NewCoinEvent};
 use crate::monitor::price::spawn_price_tracker;
 use crate::telegram;
 
-// ── MEXC Announcement API response types ─────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-struct AnnResponse {
-    data: Option<AnnData>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AnnData {
-    items: Option<Vec<AnnItem>>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-struct AnnItem {
-    title: String,
-    #[serde(rename = "articleId")]
-    article_id: Option<String>,
-    #[serde(rename = "publishTime")]
-    publish_time: Option<u64>,
-}
-
 // ── Internal parsed listing ───────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -43,12 +22,20 @@ pub struct PendingListing {
     pub base: String,
     /// Unix ms of trading open — 0 means TBD
     pub open_time_ms: u64,
-    /// When we first discovered this listing (for TBD cleanup)
     pub discovered_at_ms: u64,
     pub title: String,
     pub article_url: String,
     pub warned: bool,
     pub ws_opened: bool,
+}
+
+/// Raw scraped announcement item
+#[derive(Debug, Clone)]
+struct ScrapedItem {
+    title: String,
+    article_url: String,
+    /// "about 2 hours ago" / "1 day ago" etc.
+    age_text: String,
 }
 
 const HOURS_24_MS: u64 = 24 * 60 * 60 * 1_000;
@@ -61,8 +48,10 @@ pub async fn run(
     known: Arc<DashSet<String>>,
 ) -> Result<()> {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .timeout(Duration::from_secs(20))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+                     AppleWebKit/537.36 (KHTML, like Gecko) \
+                     Chrome/124.0.0.0 Safari/537.36")
         .build()?;
 
     info!("📢 Announcement monitor started (poll every 60s | window: last 24h)");
@@ -76,11 +65,9 @@ pub async fn run(
         match fetch_announcements(&client).await {
             Ok(items) => {
                 for item in items {
-                    // 24-hour filter
-                    if let Some(pt) = item.publish_time {
-                        if now.saturating_sub(pt) > HOURS_24_MS {
-                            continue;
-                        }
+                    // 24h filter based on age_text
+                    if !is_within_24h(&item.age_text) {
+                        continue;
                     }
 
                     if seen_titles.contains(&item.title) {
@@ -108,23 +95,12 @@ pub async fn run(
 
                     seen_titles.insert(item.title.clone());
 
-                    let article_url = item
-                        .article_id
-                        .as_ref()
-                        .map(|id| format!("https://www.mexc.com/support/articles/{id}"))
-                        .unwrap_or_else(|| {
-                            "https://www.mexc.com/support/categories/announcements".to_string()
-                        });
-
-                    // Try title first, then article body
+                    // Try title first, then fetch article body for datetime
                     let mut open_time_ms = parse_datetime_from_text(&item.title).unwrap_or(0);
 
                     if open_time_ms == 0 {
-                        if let Some(ref id) = item.article_id {
-                            let body_url = format!("https://www.mexc.com/support/articles/{}", id);
-                            if let Ok(body) = fetch_text(&client, &body_url).await {
-                                open_time_ms = parse_datetime_from_text(&body).unwrap_or(0);
-                            }
+                        if let Ok(body) = fetch_text(&client, &item.article_url).await {
+                            open_time_ms = parse_datetime_from_text(&body).unwrap_or(0);
                         }
                     }
 
@@ -136,7 +112,7 @@ pub async fn run(
                         open_time_ms,
                         discovered_at_ms: now,
                         title: item.title.clone(),
-                        article_url: article_url.clone(),
+                        article_url: item.article_url.clone(),
                         warned: false,
                         ws_opened: false,
                     };
@@ -203,39 +179,190 @@ pub async fn run(
     }
 }
 
-// ── Fetcher ───────────────────────────────────────────────────────────────────
+// ── HTML scraper ──────────────────────────────────────────────────────────────
 
-async fn fetch_announcements(client: &reqwest::Client) -> Result<Vec<AnnItem>> {
-    let endpoints = [
-        "https://www.mexc.com/api/platform/announce/list?pageNum=1&pageSize=30&annType=coin_listings",
-        "https://www.mexc.com/api/platform/announce/list?pageNum=1&pageSize=30&annType=new_listing",
-        "https://www.mexc.com/api/platform/announce/list?pageNum=1&pageSize=30",
-        "https://api.mexc.com/api/v1/announcement?pageNum=1&pageSize=30&type=new_listings",
-        "https://api.mexc.com/api/v1/announcement?pageNum=1&pageSize=30",
+/// Scrape the public MEXC announcements page (HTML) — no API key required.
+/// Falls back to the Spot-filtered page and the support portal.
+async fn fetch_announcements(client: &reqwest::Client) -> Result<Vec<ScrapedItem>> {
+    let pages = [
+        "https://www.mexc.com/announcements/new-listings",
+        "https://www.mexc.com/announcements/new-listings/spot-18",
+        "https://www.mexc.com/announcements/all",
     ];
 
-    for url in &endpoints {
-        if let Ok(resp) = client.get(*url).send().await {
-            if resp.status().is_success() {
-                if let Ok(body) = resp.text().await {
-                    if let Ok(parsed) = serde_json::from_str::<AnnResponse>(&body) {
-                        let items = parsed.data.and_then(|d| d.items).unwrap_or_default();
-                        if !items.is_empty() {
-                            info!("📡 Announcement endpoint OK: {}", url);
-                            return Ok(deduplicate(items));
-                        }
-                    }
+    for url in &pages {
+        match client.get(*url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let html = resp.text().await.unwrap_or_default();
+                let items = parse_html_announcements(&html);
+                if !items.is_empty() {
+                    info!("📡 Scraped {} announcements from {}", items.len(), url);
+                    return Ok(items);
                 }
             }
+            _ => {}
         }
     }
 
     Ok(vec![])
 }
 
-fn deduplicate(items: Vec<AnnItem>) -> Vec<AnnItem> {
-    let mut seen = std::collections::HashSet::new();
-    items.into_iter().filter(|i| seen.insert(i.title.clone())).collect()
+/// Parse article links, titles and age from raw HTML.
+/// MEXC pages embed articles as:
+///   <a href="/announcements/article/SLUG" title="TITLE">...</a>
+///   followed shortly by  "about X hours ago" | "X days ago"
+fn parse_html_announcements(html: &str) -> Vec<ScrapedItem> {
+    let mut items = Vec::new();
+
+    // Find every occurrence of /announcements/article/ href
+    let mut search = html;
+    loop {
+        let anchor = match search.find("/announcements/article/") {
+            Some(i) => i,
+            None => break,
+        };
+
+        // Walk back to find start of href="
+        let prefix = &search[..anchor];
+        let href_start = match prefix.rfind("href=\"") {
+            Some(i) => i + 6, // skip href="
+            None => { search = &search[anchor + 1..]; continue; }
+        };
+
+        let slug_str = &search[href_start..];
+        let slug_end = match slug_str.find('"') {
+            Some(i) => i,
+            None => { search = &search[anchor + 1..]; continue; }
+        };
+        let relative_url = &slug_str[..slug_end];
+        let article_url = format!("https://www.mexc.com{}", relative_url);
+
+        // Extract title from title="..." attribute or inner text
+        let rest = &search[anchor..];
+        let title = extract_title_from_nearby_html(rest);
+
+        // Extract age text — look for "ago" near this anchor
+        let age_window = &rest[..rest.len().min(2000)];
+        let age_text = extract_age_text(age_window);
+
+        if !title.is_empty() {
+            items.push(ScrapedItem { title, article_url, age_text });
+        }
+
+        // Advance past this anchor to avoid duplicates from the same article
+        let advance = slug_end + anchor + href_start;
+        if advance == 0 { break; }
+        search = &search[advance..];
+    }
+
+    // Deduplicate by article URL
+    let mut seen_urls = std::collections::HashSet::new();
+    items.retain(|i| seen_urls.insert(i.article_url.clone()));
+
+    items
+}
+
+/// Extract title from the HTML near an article link.
+/// Tries title="..." attribute first, then <h2>/<h3> text.
+fn extract_title_from_nearby_html(html: &str) -> String {
+    // Try title="..." in first 500 chars
+    let window = &html[..html.len().min(500)];
+
+    if let Some(ti) = window.find("title=\"") {
+        let after = &window[ti + 7..];
+        if let Some(end) = after.find('"') {
+            let t = after[..end].trim().to_string();
+            if t.len() > 10 {
+                return html_decode(&t);
+            }
+        }
+    }
+
+    // Try >TEXT< between tags (strip HTML tags)
+    let stripped = strip_tags(window);
+    let line = stripped
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| l.len() > 15 && !l.starts_with('#') && !l.is_empty())
+        .unwrap_or("")
+        .to_string();
+
+    html_decode(&line)
+}
+
+fn extract_age_text(html: &str) -> String {
+    // Find "ago" and walk back to get the full phrase
+    let window = &html[..html.len().min(3000)];
+    if let Some(ago_pos) = window.find(" ago") {
+        let before = &window[..ago_pos];
+        // Walk back up to 30 chars to find the number + unit
+        let start = before.len().saturating_sub(30);
+        let phrase = &before[start..];
+        let stripped = strip_tags(phrase).trim().to_string();
+        // Take last meaningful part
+        let parts: Vec<&str> = stripped.split_whitespace().collect();
+        if parts.len() >= 2 {
+            let n = parts.len();
+            return format!("{} {} ago", parts[n-2], parts[n-1]);
+        }
+        return "hours ago".to_string(); // default: treat as recent
+    }
+    // If no "ago" found, treat as within 24h (to be safe)
+    String::new()
+}
+
+/// Rough check: return true if within the last ~24h based on text like
+/// "about 2 hours ago", "about 1 hour ago", "1 day ago", "23 hours ago"
+fn is_within_24h(age_text: &str) -> bool {
+    if age_text.is_empty() {
+        return true; // no time info → include
+    }
+
+    let lo = age_text.to_lowercase();
+
+    if lo.contains("hour") {
+        // "about 5 hours ago" → always within 24h
+        return true;
+    }
+
+    if lo.contains("minute") || lo.contains("second") {
+        return true;
+    }
+
+    if lo.contains("day") {
+        // Extract number of days
+        let n: u64 = lo
+            .split_whitespace()
+            .find_map(|w| w.parse::<u64>().ok())
+            .unwrap_or(2);
+        return n <= 1; // "1 day ago" ≈ borderline, keep it
+    }
+
+    // "just now" etc.
+    true
+}
+
+fn strip_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn html_decode(s: &str) -> String {
+    s.replace("&amp;", "&")
+     .replace("&lt;", "<")
+     .replace("&gt;", ">")
+     .replace("&quot;", "\"")
+     .replace("&#39;", "'")
+     .replace("&nbsp;", " ")
 }
 
 async fn fetch_text(client: &reqwest::Client, url: &str) -> Result<String> {
@@ -248,7 +375,7 @@ async fn fetch_text(client: &reqwest::Client, url: &str) -> Result<String> {
 fn extract_symbol(title: &str) -> Option<String> {
     let candidates = extract_between(title, '(', ')');
 
-    // Priority 1: (XYZUSDT) — already has USDT
+    // Priority 1: (XYZUSDT)
     for c in &candidates {
         let s = c.trim();
         if s.ends_with("USDT")
@@ -261,7 +388,7 @@ fn extract_symbol(title: &str) -> Option<String> {
         }
     }
 
-    // Priority 2: (ENM) — bare ticker, append USDT
+    // Priority 2: (ENM) → ENMUSDT
     for c in &candidates {
         let s = c.trim();
         if s.len() >= 2
@@ -276,7 +403,7 @@ fn extract_symbol(title: &str) -> Option<String> {
         }
     }
 
-    // Priority 3: "ENM/USDT" anywhere in title
+    // Priority 3: XXX/USDT anywhere in title
     for word in title.split_whitespace() {
         let w = word.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '/');
         if let Some(ticker) = w.strip_suffix("/USDT") {
@@ -310,7 +437,8 @@ fn is_futures_title(title: &str) -> bool {
 
 fn parse_datetime_from_text(text: &str) -> Option<u64> {
     // Pattern 1: ISO "YYYY-MM-DD HH:MM"
-    for i in 0..text.len().saturating_sub(15) {
+    let bytes = text.as_bytes();
+    for i in 0..bytes.len().saturating_sub(15) {
         if text.is_char_boundary(i) {
             if let Some(ms) = try_parse_iso(&text[i..]) {
                 return Some(ms);
@@ -321,7 +449,7 @@ fn parse_datetime_from_text(text: &str) -> Option<u64> {
     if let Some(ms) = try_parse_day_first(text) {
         return Some(ms);
     }
-    // Pattern 3: "April 11, 2026 11:00"
+    // Pattern 3: "Apr 11, 2026, 11:00" / "April 11, 2026 11:00"
     if let Some(ms) = try_parse_month_first(text) {
         return Some(ms);
     }
@@ -345,15 +473,13 @@ fn try_parse_iso(s: &str) -> Option<u64> {
     Some(datetime_to_unix_ms(year, month, day, hour, min))
 }
 
-/// "11 أبريل 2026، الساعة 11:00 (UTC)"
 fn try_parse_day_first(text: &str) -> Option<u64> {
     let tokens: Vec<&str> = text
-        .split(|c: char| c == ' ' || c == ',' || c == '،' || c == '\n' || c == '\t' || c == '\r')
+        .split(|c: char| c == ' ' || c == ',' || c == '،' || c == '\n' || c == '\t')
         .filter(|t| !t.is_empty())
         .collect();
     let len = tokens.len();
     if len < 4 { return None; }
-
     for i in 0..len.saturating_sub(3) {
         let day: u32 = match tokens[i].trim_matches(|c: char| !c.is_ascii_digit()).parse::<u32>() {
             Ok(d) if d >= 1 && d <= 31 => d,
@@ -377,15 +503,13 @@ fn try_parse_day_first(text: &str) -> Option<u64> {
     None
 }
 
-/// "April 11, 2026 11:00 (UTC)"
 fn try_parse_month_first(text: &str) -> Option<u64> {
     let tokens: Vec<&str> = text
-        .split(|c: char| c == ' ' || c == ',' || c == '،' || c == '\n' || c == '\t' || c == '\r')
+        .split(|c: char| c == ' ' || c == ',' || c == '،' || c == '\n' || c == '\t')
         .filter(|t| !t.is_empty())
         .collect();
     let len = tokens.len();
     if len < 4 { return None; }
-
     for i in 0..len.saturating_sub(3) {
         let month_num = match month_name_to_num(tokens[i]) {
             Some(m) => m,
@@ -436,7 +560,7 @@ fn month_name_to_num(s: &str) -> Option<u32> {
     }
 }
 
-// ── Shared helpers ────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn extract_between(s: &str, open: char, close: char) -> Vec<String> {
     let mut results = Vec::new();
@@ -482,7 +606,7 @@ fn datetime_to_unix_ms(year: u32, month: u32, day: u32, hour: u32, min: u32) -> 
 }
 
 fn format_time_ms(ms: u64) -> String {
-    let secs = ms / 1_000;
+    let secs  = ms / 1_000;
     let mins  = (secs / 60) % 60;
     let hours = (secs / 3_600) % 24;
     let days  = secs / 86_400;
@@ -521,9 +645,9 @@ async fn send_announcement_alert(config: &Config, listing: &PendingListing) {
          🔗 MEXC    : https://www.mexc.com/exchange/{sym}\n\
          ──────────────────────────\n\
          ⚡ البوت سيفتح WS قبل 30 ثانية من الفتح تلقائياً",
-        sym          = listing.symbol,
-        title        = listing.title,
-        article_url  = listing.article_url,
+        sym         = listing.symbol,
+        title       = listing.title,
+        article_url = listing.article_url,
     );
     telegram::send_html(config, &msg).await;
 }
