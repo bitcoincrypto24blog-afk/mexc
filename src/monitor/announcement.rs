@@ -196,6 +196,12 @@ async fn fetch_announcements(client: &reqwest::Client) -> Result<Vec<ScrapedItem
         match client.get(*url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 let html = resp.text().await.unwrap_or_default();
+                let has_article = html.contains("/announcements/article/");
+                info!(
+                    "🔍 [DEBUG] {} → size={}b | has_article_link={} | preview: {}",
+                    url, html.len(), has_article,
+                    &html[..html.len().min(300)].replace('\n', " ")
+                );
                 let items = parse_html_announcements(&html);
                 info!("📡 Scraped {} announcements from {}", items.len(), url);
                 for item in items {
