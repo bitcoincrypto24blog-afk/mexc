@@ -184,38 +184,296 @@ pub async fn run(
 /// Scrape the public MEXC announcements page (HTML) — no API key required.
 /// Falls back to the Spot-filtered page and the support portal.
 async fn fetch_announcements(client: &reqwest::Client) -> Result<Vec<ScrapedItem>> {
-    let pages = [
-        "https://www.mexc.com/newlisting",
-        "https://www.mexc.com/announcements/new-listings",
-    ];
-
     let mut all_items: Vec<ScrapedItem> = Vec::new();
     let mut seen_urls: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut source_report: Vec<(&'static str, &'static str, usize)> = Vec::new();
+    // (source_name, status_emoji, items_found)
 
-    for url in &pages {
-        match client.get(*url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                let html = resp.text().await.unwrap_or_default();
-                let has_article = html.contains("/announcements/article/");
-                info!(
-                    "🔍 [DEBUG] {} → size={}b | has_article_link={} | preview: {}",
-                    url, html.len(), has_article,
-                    &html[..html.len().min(300)].replace('\n', " ")
-                );
-                let items = parse_html_announcements(&html);
-                info!("📡 Scraped {} announcements from {}", items.len(), url);
-                for item in items {
-                    if seen_urls.insert(item.article_url.clone()) {
-                        all_items.push(item);
-                    }
+    // Helper to merge items into all_items dedup'd
+    macro_rules! merge {
+        ($items:expr) => {{
+            let mut count = 0usize;
+            for item in $items {
+                if seen_urls.insert(item.article_url.clone()) {
+                    all_items.push(item);
+                    count += 1;
                 }
             }
-            Err(e) => warn!("Failed to fetch {}: {e}", url),
-            _ => warn!("Non-success response from {}", url),
+            count
+        }};
+    }
+
+    // ── Source 1: MEXC JSON API — ann/record/list (new_listings) ──────────────
+    {
+        let url = "https://www.mexc.com/api/platform/ann/record/list\
+                   ?announcementType=new_listings&pageSize=20&pageNum=1";
+        let (status, count) = try_json_source(client, url).await;
+        let n = merge!(count);
+        source_report.push(("API/ann-new-listings", status, n));
+    }
+
+    // ── Source 2: MEXC JSON API — ann/record/list (spot) ──────────────────────
+    {
+        let url = "https://www.mexc.com/api/platform/ann/record/list\
+                   ?announcementType=spot&pageSize=20&pageNum=1";
+        let (status, count) = try_json_source(client, url).await;
+        let n = merge!(count);
+        source_report.push(("API/ann-spot", status, n));
+    }
+
+    // ── Source 3: MEXC JSON API — operation/new-listings ──────────────────────
+    {
+        let url = "https://www.mexc.com/api/operation/new-listings/query\
+                   ?pageSize=20&pageNum=1";
+        let (status, count) = try_json_source(client, url).await;
+        let n = merge!(count);
+        source_report.push(("API/operation-new-listings", status, n));
+    }
+
+    // ── Source 4: MEXC JSON API — generic ann list ────────────────────────────
+    {
+        let url = "https://www.mexc.com/api/platform/ann/list\
+                   ?category=new_listings&pageSize=20";
+        let (status, count) = try_json_source(client, url).await;
+        let n = merge!(count);
+        source_report.push(("API/ann-list", status, n));
+    }
+
+    // ── Source 5: Support center Zendesk API ──────────────────────────────────
+    {
+        let url = "https://support.mexc.com/api/v2/help_center/en-001/articles.json\
+                   ?page=1&per_page=20&sort_by=created_at&sort_order=desc";
+        let (status, count) = try_json_source(client, url).await;
+        let n = merge!(count);
+        source_report.push(("Zendesk/support-articles", status, n));
+    }
+
+    // ── Source 6: /newlisting HTML → __NEXT_DATA__ + HTML parse ───────────────
+    {
+        let url = "https://www.mexc.com/newlisting";
+        match client
+            .get(url)
+            .header("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Referer", "https://www.mexc.com/")
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                let html = resp.text().await.unwrap_or_default();
+                let nd = parse_next_data_announcements(&html);
+                let ht = parse_html_announcements(&html);
+                let n = merge!(nd) + merge!(ht);
+                source_report.push(("HTML/newlisting", "✅", n));
+            }
+            Ok(resp) => source_report.push(("HTML/newlisting",
+                Box::leak(format!("❌ HTTP {}", resp.status()).into_boxed_str()), 0)),
+            Err(_)   => source_report.push(("HTML/newlisting", "❌ err", 0)),
         }
     }
 
+    // ── Source 7: /announcements/new-listings HTML ────────────────────────────
+    {
+        let url = "https://www.mexc.com/announcements/new-listings";
+        match client
+            .get(url)
+            .header("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Referer", "https://www.mexc.com/")
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                let html = resp.text().await.unwrap_or_default();
+                let items = parse_html_announcements(&html);
+                let n = merge!(items);
+                source_report.push(("HTML/announcements", "✅", n));
+            }
+            Ok(resp) => source_report.push(("HTML/announcements",
+                Box::leak(format!("❌ HTTP {}", resp.status()).into_boxed_str()), 0)),
+            Err(_)   => source_report.push(("HTML/announcements", "❌ err", 0)),
+        }
+    }
+
+    // ── Final report ──────────────────────────────────────────────────────────
+    info!("┌─── Announcement Sources Report ───────────────────────────");
+    for (name, status, n) in &source_report {
+        if *n > 0 {
+            info!("│  ✅  {:35} → {} items", name, n);
+        } else {
+            info!("│  {}  {:35} → 0 items", status, name);
+        }
+    }
+    let working: Vec<&str> = source_report.iter()
+        .filter(|(_, _, n)| *n > 0)
+        .map(|(name, _, _)| *name)
+        .collect();
+    if working.is_empty() {
+        warn!("└─── ⚠️  ALL SOURCES FAILED — total=0");
+    } else {
+        info!("└─── 📦 Total unique: {} | Working: {}", all_items.len(), working.join(", "));
+    }
+
     Ok(all_items)
+}
+
+/// Fetch a JSON endpoint and return (status_str, parsed_items).
+async fn try_json_source(
+    client: &reqwest::Client,
+    url: &str,
+) -> (&'static str, Vec<ScrapedItem>) {
+    match client
+        .get(url)
+        .header("Accept", "application/json, text/plain, */*")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Referer", "https://www.mexc.com/")
+        .header("Origin", "https://www.mexc.com")
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            let text = resp.text().await.unwrap_or_default();
+            let items = parse_json_announcements(&text);
+            ("✅", items)
+        }
+        Ok(resp) => {
+            // leak the status string so lifetime works — small & bounded
+            let s: &'static str =
+                Box::leak(format!("❌ HTTP {}", resp.status()).into_boxed_str());
+            (s, vec![])
+        }
+        Err(_) => ("❌ err", vec![]),
+    }
+}
+
+// ── JSON API parser ───────────────────────────────────────────────────────────
+
+/// Try to parse MEXC's internal API JSON response.
+/// The response shape varies but typically looks like:
+///   { "data": { "list": [ { "title": "...", "url": "...", "publishTime": "..." } ] } }
+fn parse_json_announcements(json: &str) -> Vec<ScrapedItem> {
+    let mut items = Vec::new();
+
+    // Walk the JSON text looking for "title" fields near "url" / "articleUrl" fields
+    // We do this without a JSON library to keep deps minimal.
+    let entries = split_json_objects(json);
+    for obj in &entries {
+        let title = json_str_field(obj, "title")
+            .or_else(|| json_str_field(obj, "annTitle"))
+            .unwrap_or_default();
+        let url = json_str_field(obj, "url")
+            .or_else(|| json_str_field(obj, "articleUrl"))
+            .or_else(|| json_str_field(obj, "annUrl"))
+            .unwrap_or_default();
+        let age = json_str_field(obj, "publishTime")
+            .or_else(|| json_str_field(obj, "createTime"))
+            .unwrap_or_default();
+
+        if title.len() > 10 && url.contains("announcement") {
+            let article_url = if url.starts_with("http") {
+                url.clone()
+            } else {
+                format!("https://www.mexc.com{}", url)
+            };
+            items.push(ScrapedItem {
+                title,
+                article_url,
+                age_text: age_text_from_timestamp(&age),
+            });
+        }
+    }
+    items
+}
+
+/// Extract __NEXT_DATA__ JSON embedded by Next.js in the HTML.
+fn parse_next_data_announcements(html: &str) -> Vec<ScrapedItem> {
+    let marker = "__NEXT_DATA__";
+    if let Some(start) = html.find(marker) {
+        // find the opening { after the marker
+        if let Some(brace) = html[start..].find('{') {
+            let json_start = start + brace;
+            // find matching closing brace
+            let mut depth = 0usize;
+            let mut end = json_start;
+            for (i, c) in html[json_start..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 { end = json_start + i + 1; break; }
+                    }
+                    _ => {}
+                }
+            }
+            let next_json = &html[json_start..end];
+            return parse_json_announcements(next_json);
+        }
+    }
+    vec![]
+}
+
+/// Split a JSON string into individual {...} object strings for simple field extraction.
+fn split_json_objects(json: &str) -> Vec<String> {
+    let mut objects = Vec::new();
+    let bytes = json.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            let mut depth = 0usize;
+            let start = i;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            objects.push(json[start..=i].to_string());
+                            i += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    objects
+}
+
+/// Extract a string value from a flat JSON key.
+fn json_str_field(obj: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{}\"", key);
+    let pos = obj.find(&needle)?;
+    let after = obj[pos + needle.len()..].trim_start();
+    let after = after.strip_prefix(':')?;
+    let after = after.trim_start();
+    if after.starts_with('"') {
+        let inner = &after[1..];
+        let end = inner.find('"')?;
+        Some(inner[..end].replace("\\u0026", "&").replace("\\/", "/"))
+    } else {
+        None
+    }
+}
+
+/// Convert an ISO timestamp string like "2026-04-11T10:00:00Z" or epoch ms
+/// into an age_text like "2 hours ago" so existing is_within_24h logic works.
+fn age_text_from_timestamp(ts: &str) -> String {
+    // If it's a unix ms number
+    if let Ok(ms) = ts.parse::<u64>() {
+        let now = crate::monitor::now_ms();
+        let diff_ms = now.saturating_sub(ms);
+        let hours = diff_ms / 3_600_000;
+        let mins  = diff_ms / 60_000;
+        if hours > 0 { return format!("{} hours ago", hours); }
+        return format!("{} minutes ago", mins);
+    }
+    // If it contains a recognisable date, treat as within 24h by default
+    if ts.len() > 10 { return "1 hours ago".to_string(); }
+    String::new()
 }
 
 /// Parse article links, titles and age from raw HTML.
